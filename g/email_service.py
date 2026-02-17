@@ -32,24 +32,56 @@ class EmailService:
             print(f"[-] 创建邮箱失败: {e}")
             return None, None
 
-    def fetch_verification_code(self, email, max_attempts=30):
+    def fetch_verification_code(self, email, max_attempts=30, debug=False):
         """轮询获取验证码 GET /api/emails?mailbox=xxx"""
-        for _ in range(max_attempts):
+        if debug:
+            print(f"[DEBUG] 开始轮询获取验证码，邮箱: {email}")
+        for i in range(max_attempts):
             try:
+                if debug:
+                    print(f"[DEBUG] 第 {i+1}/{max_attempts} 次轮询...")
                 res = requests.get(
                     f"{self.base_url}/api/emails",
                     params={"mailbox": email},
                     headers=self.headers,
                     timeout=10
                 )
+                if debug:
+                    print(f"[DEBUG] 响应状态: {res.status_code}")
                 if res.status_code == 200:
                     emails = res.json()
-                    if emails and emails[0].get("verification_code"):
-                        code = emails[0]["verification_code"]
-                        return code.replace("-", "")
-            except:
-                pass
+                    if debug:
+                        print(f"[DEBUG] 响应数据: {emails}")
+                    if emails and len(emails) > 0:
+                        # 检查邮件字段
+                        first_email = emails[0]
+                        if debug:
+                            print(f"[DEBUG] 第一封邮件字段: {first_email.keys()}")
+                        # 可能的验证码字段名
+                        code = first_email.get("verification_code") or first_email.get("code") or first_email.get("verify_code")
+                        if code:
+                            if debug:
+                                print(f"[DEBUG] 获取到验证码: {code}")
+                            return code.replace("-", "")
+                        else:
+                            # 从 subject 提取验证码（格式: "XXX-XXX xAI confirmation code"）
+                            subject = first_email.get("subject", "")
+                            if debug:
+                                print(f"[DEBUG] Subject: {subject}")
+                            # 提取前 7 位（含横杠）或匹配 XXX-XXX 模式
+                            import re
+                            match = re.search(r'^([A-Z0-9]{3}-[A-Z0-9]{3})', subject)
+                            if match:
+                                code = match.group(1)
+                                if debug:
+                                    print(f"[DEBUG] 从 Subject 提取验证码: {code}")
+                                return code.replace("-", "")
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] 轮询异常: {e}")
             time.sleep(1)
+        if debug:
+            print(f"[DEBUG] 轮询结束，未获取到验证码")
         return None
 
     def delete_email(self, address):

@@ -120,6 +120,7 @@ class NsfwSettingsService:
     def enable_unhinged(
         self,
         sso: str,
+        sso_rw: str = "",
         impersonate: str = "chrome120",
         user_agent: Optional[str] = None,
         timeout: int = 30,
@@ -139,7 +140,7 @@ class NsfwSettingsService:
             "user-agent": user_agent or DEFAULT_USER_AGENT,
             "x-grpc-web": "1",
             "x-user-agent": "connect-es/2.1.1",
-            "cookie": f"sso={sso}; sso-rw={sso}"
+            "cookie": f"sso={sso}; sso-rw={sso_rw or sso}"
         }
 
         payload = bytes([0x08, 0x01, 0x10, 0x01])

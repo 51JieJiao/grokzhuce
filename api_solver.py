@@ -449,17 +449,69 @@ class TurnstileAPIServer:
             return False
 
     async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
-        """Inject CAPTCHA directly into the target website"""
+        """Inject CAPTCHA directly into the target website or use existing one"""
         script = f"""
-        // Remove any existing turnstile widgets first
+        (function() {{
+        // Check if there's already a turnstile widget on the page with matching sitekey
+        const existingWidgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+        console.log('Turnstile Debug: Found ' + existingWidgets.length + ' potential widgets');
+        let useExisting = false;
+        let foundSitekey = null;
+        
+        for (const widget of existingWidgets) {{
+            const widgetSitekey = widget.getAttribute('data-sitekey');
+            console.log('Turnstile Debug: Checking widget with sitekey:', widgetSitekey);
+            if (widgetSitekey === '{websiteKey}') {{
+                useExisting = true;
+                foundSitekey = widgetSitekey;
+                console.log('Turnstile Debug: Found existing turnstile widget with matching sitekey');
+                break;
+            }}
+        }}
+        
+        // Also check for iframe-based turnstile
+        const turnstileIframes = document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]');
+        console.log('Turnstile Debug: Found ' + turnstileIframes.length + ' turnstile iframes');
+        
+        // Create hidden input for token if not exists
+        let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+        if (!tokenInput) {{
+            tokenInput = document.createElement('input');
+            tokenInput.type = 'hidden';
+            tokenInput.name = 'cf-turnstile-response';
+            document.body.appendChild(tokenInput);
+        }}
+        
+        // Setup token capture callback
+        window._turnstileTokenCallback = function(token) {{
+            console.log('Turnstile token captured:', token);
+            tokenInput.value = token;
+        }};
+        
+        // If existing widget found, try to hook into it
+        if (useExisting) {{
+            console.log('Using existing turnstile widget');
+            // Try to override the existing callback or add our own
+            const originalCallback = window.turnstileCallback;
+            window.turnstileCallback = function(token) {{
+                window._turnstileTokenCallback(token);
+                if (originalCallback) originalCallback(token);
+            }};
+            // Also try to set up a mutation observer to capture token changes
+            return 'existing';
+        }}
+        
+        // Remove any existing turnstile widgets that don't match our sitekey
         document.querySelectorAll('.cf-turnstile').forEach(el => el.remove());
-        document.querySelectorAll('[data-sitekey]').forEach(el => el.remove());
+        document.querySelectorAll('[data-sitekey]').forEach(el => {{
+            if (el.getAttribute('data-sitekey') !== '{websiteKey}') el.remove();
+        }});
         
         // Create turnstile widget directly on the page
         const captchaDiv = document.createElement('div');
         captchaDiv.className = 'cf-turnstile';
         captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
-        captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
+        captchaDiv.setAttribute('data-callback', '_turnstileTokenCallback');
         {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
         {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
         captchaDiv.style.position = 'fixed';
@@ -493,15 +545,7 @@ class TurnstileAPIServer:
                                 {f'cdata: "{cdata}",' if cdata else ''}
                                 callback: function(token) {{
                                     console.log('Turnstile solved with token:', token);
-                                    // Create hidden input for token
-                                    let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                                    if (!tokenInput) {{
-                                        tokenInput = document.createElement('input');
-                                        tokenInput.type = 'hidden';
-                                        tokenInput.name = 'cf-turnstile-response';
-                                        document.body.appendChild(tokenInput);
-                                    }}
-                                    tokenInput.value = token;
+                                    window._turnstileTokenCallback(token);
                                 }},
                                 'error-callback': function(error) {{
                                     console.log('Turnstile error:', error);
@@ -531,14 +575,7 @@ class TurnstileAPIServer:
                     {f'cdata: "{cdata}",' if cdata else ''}
                     callback: function(token) {{
                         console.log('Turnstile solved with token:', token);
-                        let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                        if (!tokenInput) {{
-                            tokenInput = document.createElement('input');
-                            tokenInput.type = 'hidden';
-                            tokenInput.name = 'cf-turnstile-response';
-                            document.body.appendChild(tokenInput);
-                        }}
-                        tokenInput.value = token;
+                        window._turnstileTokenCallback(token);
                     }},
                     'error-callback': function(error) {{
                         console.log('Turnstile error:', error);
@@ -556,11 +593,18 @@ class TurnstileAPIServer:
         window.onTurnstileCallback = function(token) {{
             console.log('Global turnstile callback executed:', token);
         }};
+        
+        return 'injected';
+        }})();
         """
 
-        await page.evaluate(script)
+        result = await page.evaluate(script)
         if self.debug:
-            logger.debug(f"Browser {index}: Injected CAPTCHA directly into website with sitekey: {websiteKey}")
+            if result == 'existing':
+                logger.debug(f"Browser {index}: Detected existing turnstile widget with matching sitekey")
+            else:
+                logger.debug(f"Browser {index}: Injected new CAPTCHA widget with sitekey: {websiteKey}")
+        return result
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
@@ -717,15 +761,62 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.goto(url, wait_until='networkidle', timeout=30000)
 
             await self._unblock_rendering(page)
-
+            
+            # Wait for turnstile to load (it may be lazy loaded)
+            if self.debug:
+                logger.debug(f"Browser {index}: Waiting for turnstile to appear...")
+            
+            # Try to wait for turnstile widget to appear
+            turnstile_found = False
+            for wait_attempt in range(15):
+                widget_count = await page.locator('.cf-turnstile, [data-sitekey]').count()
+                iframe_count = await page.locator('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]').count()
+                
+                # Also check if turnstile API is available
+                turnstile_ready = await page.evaluate("""() => {
+                    return typeof window.turnstile !== 'undefined';
+                }""")
+                
+                if self.debug and wait_attempt % 3 == 0:
+                    logger.debug(f"Browser {index}: Wait {wait_attempt + 1}s - {widget_count} widgets, {iframe_count} iframes, turnstile API: {turnstile_ready}")
+                
+                if widget_count > 0 or iframe_count > 0 or turnstile_ready:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Turnstile ready after {wait_attempt + 1}s (widgets: {widget_count}, iframes: {iframe_count}, API: {turnstile_ready})")
+                    turnstile_found = True
+                    break
+                await asyncio.sleep(1)
+            
+            if not turnstile_found:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Turnstile not found naturally, will inject our own")
+            
             # Сразу инъектируем виджет Turnstile на целевой сайт
             if self.debug:
                 logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
             
-            await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+            # Debug: Check page state before injection
+            if self.debug:
+                widget_count = await page.locator('.cf-turnstile, [data-sitekey]').count()
+                iframe_count = await page.locator('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]').count()
+                logger.debug(f"Browser {index}: Before injection - {widget_count} widgets, {iframe_count} iframes")
+                # Check for sitekey attribute
+                try:
+                    sitekey_elem = await page.locator('[data-sitekey]').get_attribute('data-sitekey')
+                    logger.debug(f"Browser {index}: Found sitekey: {sitekey_elem}")
+                except:
+                    pass
+            
+            inject_result = await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+            
+            if self.debug:
+                if inject_result == 'existing':
+                    logger.debug(f"Browser {index}: Using existing turnstile widget on page")
+                else:
+                    logger.debug(f"Browser {index}: Injected new turnstile widget")
             
             # Ждем время для загрузки и рендеринга виджета
             await asyncio.sleep(3)
@@ -748,6 +839,11 @@ class TurnstileAPIServer:
                     if count == 0:
                         if self.debug and attempt % 5 == 0:
                             logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                        # Also check if turnstile widget exists on page
+                        if self.debug and attempt == 0:
+                            widget_count = await page.locator('.cf-turnstile, [data-sitekey]').count()
+                            iframe_count = await page.locator('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]').count()
+                            logger.debug(f"Browser {index}: Page has {widget_count} turnstile widgets and {iframe_count} iframes")
                     elif count == 1:
                         # Если только один элемент, проверяем его токен
                         try:
